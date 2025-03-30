@@ -1,18 +1,44 @@
+﻿version: '3.8'
+
 services:
   backend:
-    build: ./backend
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
     ports:
-      - "5000:5000"
-    env_file:
-      - ./backend/.env
+      - "6000:5000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    restart: unless-stopped
+      - ./backend:/app
+    environment:
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - FLASK_ENV=development  # Added for better Flask configuration
+    networks:
+      - app-network  # Added explicit network
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5000/health || exit 1"]  # More reliable check
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped  # Added automatic restart policy
 
   frontend:
     image: nginx:alpine
     ports:
-      - "80:80"
+      - "7000:80"
     volumes:
-      - ./frontend:/usr/share/nginx/html:ro
+      - ./frontend:/usr/share/nginx/html
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf
+    depends_on:
+      backend:
+        condition: service_healthy  # Wait for backend to be healthy
+    networks:
+      - app-network
     restart: unless-stopped
+
+networks:
+  app-network:
+    driver: bridge
+    name: docker-builder-net  # Explicit network naming
