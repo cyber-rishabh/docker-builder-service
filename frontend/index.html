@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Docker Builder</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; }
+        form { display: flex; flex-direction: column; gap: 10px; }
+        input, button { padding: 8px; font-size: 16px; }
+    </style>
+</head>
+<body>
+    <h1>Docker Image Builder</h1>
+    <form id="buildForm">
+        <input type="url" id="repoUrl" placeholder="GitHub Repo URL" required>
+        <button type="submit">Build Image</button>
+    </form>
+    <div id="result" style="margin-top: 20px;"></div>
+    <script>
+        document.getElementById('buildForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const response = await fetch('http://localhost:5000/build', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    repo_url: document.getElementById('repoUrl').value
+                })
+            });
+            const result = await response.json();
+            document.getElementById('result').innerHTML =
+                result.error ? `<p style="color:red">Error: ${result.error}</p>` :
+                `<p>Image built successfully!<br><code>${result.pull_cmd}</code></p>`;
+        });
+    </script>
+</body>
+</html>
