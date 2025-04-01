@@ -3,6 +3,7 @@ import subprocess
 import shutil
 import logging
 import time
+import re
 from pathlib import Path
 from urllib.parse import urlparse
 from flask import Flask, request, jsonify
@@ -18,12 +19,11 @@ app = Flask(__name__)
 # Initialize Docker client with error handling
 try:
     client = docker.from_env()
-    client.ping()  # Test connection
+    client.ping()
     logger.info("Docker connection established")
 except Exception as e:
     logger.error(f"Docker connection failed: {str(e)}")
     client = None
-    # Consider sys.exit(1) if Docker is mandatory
 
 # Load environment variables
 try:
@@ -35,25 +35,68 @@ try:
 except Exception as e:
     logger.warning(f"Couldn't load .env: {str(e)}")
 
-# Dockerfile templates
-DOCKERFILE_TEMPLATES = {
-    'static': """FROM nginx:alpine
-COPY . /usr/share/nginx/html
-EXPOSE 80
-CMD ["nginx", "-g", "daemon off;"]""",
-
-    'node': """FROM node:16-alpine
+# Enhanced project templates with priority order
+PROJECT_CONFIGS = [
+    {
+        'type': 'nextjs',
+        'detect': ['next.config.js'],
+        'dockerfile': """FROM node:16
 WORKDIR /app
 COPY package*.json ./
 RUN npm install
 COPY . .
-CMD ["npm", "start"]""",
-
-    'default': """FROM alpine
-COPY . /app
+RUN npm run build
+EXPOSE 3000
+CMD ["npm", "run", "start"]""",
+        'port': 3000
+    },
+    {
+        'type': 'react',
+        'detect': ['package.json', 'src/App.js'],
+        'dockerfile': """FROM node:16
 WORKDIR /app
-CMD ["ls", "-la"]"""
-}
+COPY package*.json ./
+RUN npm install
+COPY . .
+RUN npm run build
+EXPOSE 3000
+CMD ["npm", "start"]""",
+        'port': 3000
+    },
+    {
+        'type': 'node',
+        'detect': ['package.json'],
+        'dockerfile': """FROM node:16
+WORKDIR /app
+COPY package*.json ./
+RUN npm install
+COPY . .
+EXPOSE 3000
+CMD ["npm", "start"]""",
+        'port': 3000
+    },
+    {
+        'type': 'python',
+        'detect': ['requirements.txt'],
+        'dockerfile': """FROM python:3.9
+WORKDIR /app
+COPY requirements.txt ./
+RUN pip install -r requirements.txt
+COPY . .
+EXPOSE 5000
+CMD ["python", "app.py"]""",
+        'port': 5000
+    },
+    {
+        'type': 'static',
+        'detect': ['index.html'],
+        'dockerfile': """FROM nginx:alpine
+COPY . /usr/share/nginx/html
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]""",
+        'port': 80
+    }
+]
 
 
 def clean_build_dir(build_dir: Path):
@@ -67,13 +110,13 @@ def clean_build_dir(build_dir: Path):
         except Exception as e:
             logger.warning(f"Clean failed (attempt {attempt + 1}): {str(e)}")
             time.sleep(1)
-    raise RuntimeError(f"Failed to clean build directory after 3 attempts: {build_dir}")
+    raise RuntimeError(f"Failed to clean build directory: {build_dir}")
 
 
 def clone_repository(repo_url: str, build_dir: Path):
     """Clone repository with comprehensive error handling"""
     try:
-        result = subprocess.run(
+        subprocess.run(
             ['git', 'clone', '--depth', '1', repo_url, str(build_dir)],
             check=True,
             stdout=subprocess.PIPE,
@@ -92,71 +135,36 @@ def clone_repository(repo_url: str, build_dir: Path):
 
 def detect_project_type(build_dir: Path):
     """Detect project type based on files present"""
-    if (build_dir / 'package.json').exists():
-        return 'node'
-    elif (build_dir / 'index.html').exists():
-        return 'static'
-    return 'default'
-
-
-def build_docker_image(build_dir: Path, repo_name: str):
-    """Build Docker image with comprehensive logging"""
-    if not client:
-        raise RuntimeError("Docker service unavailable")
-
-    try:
-        # Auto-generate Dockerfile if needed
-        if not (build_dir / 'Dockerfile').exists():
-            project_type = detect_project_type(build_dir)
-            with open(build_dir / 'Dockerfile', 'w') as f:
-                f.write(DOCKERFILE_TEMPLATES[project_type])
-            logger.info(f"Generated {project_type} Dockerfile")
-
-        image, build_logs = client.images.build(
-            path=str(build_dir),
-            tag=f"builder/{repo_name.replace('.', '-')}:latest",
-            rm=True,
-            forcerm=True
-        )
-
-        # Filter and limit logs
-        logs = [
-                   line.get('stream', '').strip()
-                   for line in build_logs
-                   if 'stream' in line and line['stream'].strip()
-               ][-20:]  # Last 20 lines only
-
-        logger.info(f"Successfully built image: {image.tags[0]}")
-        return image, logs
-
-    except docker.errors.BuildError as e:
-        logger.error(f"Build failed: {str(e)}")
-        raise RuntimeError(f"Docker build failed: {e.msg}")
-    except docker.errors.APIError as e:
-        logger.error(f"Docker API error: {str(e)}")
-        raise RuntimeError("Docker service error")
+    for config in PROJECT_CONFIGS:
+        if all((build_dir / file).exists() for file in config['detect']):
+            return config
+    return PROJECT_CONFIGS[-1]  # Default to static
 
 
 @app.route('/')
 def home():
+    """Root endpoint showing service status"""
     return jsonify({
         "status": "ready",
         "endpoints": {
             "build": "POST /build",
             "health": "GET /health"
         },
-        "docker_available": bool(client)
+        "docker_available": bool(client),
+        "supported_project_types": [c['type'] for c in PROJECT_CONFIGS]
     })
 
 
 @app.route('/health')
 def health_check():
+    """Health check endpoint"""
     try:
         disk_usage = shutil.disk_usage('/')
         status = {
             "status": "healthy",
             "disk_space": f"{disk_usage.free / (1024 ** 3):.1f}GB free",
-            "docker": "connected" if client else "disconnected"
+            "docker": "connected" if client else "disconnected",
+            "timestamp": time.time()
         }
         return jsonify(status)
     except Exception as e:
@@ -166,6 +174,7 @@ def health_check():
 
 @app.route('/build', methods=['POST'])
 def build_image():
+    """Main build endpoint"""
     if not request.is_json:
         return jsonify({"error": "Request must be JSON"}), 400
 
@@ -181,27 +190,33 @@ def build_image():
         if not all([parsed.scheme, parsed.netloc]):
             return jsonify({"error": "Invalid repository URL"}), 400
 
-        repo_name = Path(parsed.path).stem or "unnamed"
+        repo_name = re.sub(r'[^a-z0-9-]', '-', Path(parsed.path).stem.lower())
         build_dir = Path(f"/tmp/builds/{repo_name}")
 
         try:
             clean_build_dir(build_dir)
             clone_repository(repo_url, build_dir)
 
-            # Special handling for GitHub Pages
-            if 'github.io' in repo_url.lower():
-                if not (build_dir / 'Dockerfile').exists():
-                    with open(build_dir / 'Dockerfile', 'w') as f:
-                        f.write(DOCKERFILE_TEMPLATES['static'])
-                    logger.info("Auto-generated static site Dockerfile")
+            config = detect_project_type(build_dir)
 
-            image, logs = build_docker_image(build_dir, repo_name)
+            with open(build_dir / 'Dockerfile', 'w') as f:
+                f.write(config['dockerfile'])
+
+            image, build_logs = client.images.build(
+                path=str(build_dir),
+                tag=f"builder/{repo_name}:latest",
+                rm=True
+            )
 
             return jsonify({
                 "status": "success",
                 "image": image.tags[0],
-                "logs": logs,
-                "run_command": f"docker run -p 8080:80 {image.tags[0]}"
+                "type": config['type'],
+                "port": config['port'],
+                "logs": [line.get('stream', '').strip()
+                         for line in build_logs
+                         if 'stream' in line and line['stream'].strip()][-20:],
+                "run_command": f"docker run -p 8080:{config['port']} {image.tags[0]}"
             })
 
         except Exception as e:
@@ -209,8 +224,7 @@ def build_image():
             return jsonify({"error": str(e)}), 500
 
         finally:
-            if build_dir.exists():
-                shutil.rmtree(build_dir, ignore_errors=True)
+            shutil.rmtree(build_dir, ignore_errors=True)
 
     except Exception as e:
         logger.exception("Unexpected error in build endpoint")
